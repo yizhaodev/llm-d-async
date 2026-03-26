@@ -12,8 +12,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/llm-d-incubation/llm-d-async/pkg/async/api"
-	"github.com/llm-d-incubation/llm-d-async/pkg/async/inference/flowcontrol"
 	"github.com/llm-d-incubation/llm-d-async/pkg/util"
+
 	"github.com/redis/go-redis/v9"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/logging"
@@ -31,18 +31,35 @@ var (
 	ssQueuesConfigFile   = flag.String("redis.ss.queues-config-file", "", "Multiple queues config file")
 	ssPollIntervalMs     = flag.Int("redis.ss.poll-interval-ms", 1000, "Poll interval in milliseconds")
 	ssBatchSize          = flag.Int("redis.ss.batch-size", 10, "Number of messages to process per poll")
+	ssGateType           = flag.String("redis.ss.gate-type", "", "Gate type for single-queue mode (e.g. redis, prometheus-saturation)")
+	ssGateParamsJSON     = flag.String("redis.ss.gate-params", "{}", "JSON-encoded gate params map for single-queue mode")
 )
 
+// parseGateParams parses a JSON-encoded string (from --redis.ss.gate-params)
+// into a map[string]string for gate parameter configuration.
+// Used to pass gate parameters from CLI or YAML to the gate factory.
+func parseGateParams(s string) map[string]string {
+	m := map[string]string{}
+	if s == "" || s == "{}" {
+		return m
+	}
+	_ = json.Unmarshal([]byte(s), &m)
+	return m
+}
+
 type queueConfig struct {
-	QueueName          string `json:"queue_name"`
-	InferenceObjective string `json:"inference_objective"`
-	RequestPathURL     string `json:"request_path_url"`
-	IGWBaseURl         string `json:"igw_base_url"`
+	QueueName          string            `json:"queue_name"`
+	InferenceObjective string            `json:"inference_objective"`
+	RequestPathURL     string            `json:"request_path_url"`
+	IGWBaseURl         string            `json:"igw_base_url"`
+	GateType           string            `json:"gate_type"`
+	GateParams         map[string]string `json:"gate_params,omitempty"`
 }
 
 type requestChannelData struct {
 	channel   api.RequestChannel
 	queueName string
+	gate      api.DispatchGate
 }
 
 type RedisSortedSetFlow struct {
@@ -52,53 +69,74 @@ type RedisSortedSetFlow struct {
 	resultChannel   chan api.ResultMessage
 	pollInterval    time.Duration
 	batchSize       int
-	gate            flowcontrol.DispatchGate
+	gate            api.DispatchGate
+	gateFactory     api.GateFactory
 }
 
 // SortedSetOption is a functional option for configuring RedisSortedSetFlow
 type SortedSetOption func(*RedisSortedSetFlow)
 
-// WithDispatchGate enables dispatch gating with the provided gate.
-// When enabled, the flow checks the "dispatch budget" before processing messages
-// and scales the batch size proportionally to available capacity.
-// Default: always dispatch all.
-func WithDispatchGate(gate flowcontrol.DispatchGate) SortedSetOption {
+// WithGateFactory sets a GateFactory for per-queue gate instantiation.
+// When set, gates are created per queue from config, overriding any global gate.
+func WithGateFactory(factory api.GateFactory) SortedSetOption {
 	return func(r *RedisSortedSetFlow) {
-		r.gate = gate
+		r.gateFactory = factory
 	}
 }
 
 func NewRedisSortedSetFlow(opts ...SortedSetOption) *RedisSortedSetFlow {
 	configs := loadQueueConfigs()
-	channels := make([]requestChannelData, 0, len(configs))
-
-	for _, cfg := range configs {
-		channels = append(channels, requestChannelData{
-			channel: api.RequestChannel{
-				Channel:            make(chan api.RequestMessage),
-				InferenceObjective: cfg.InferenceObjective,
-				RequestPathURL:     util.NormalizeURLPath(cfg.RequestPathURL),
-				IGWBaseURl:         util.NormalizeBaseURL(cfg.IGWBaseURl),
-			},
-			queueName: cfg.QueueName,
-		})
-	}
-
 	r := &RedisSortedSetFlow{
 		rdb:             redis.NewClient(&redis.Options{Addr: *ssRedisAddr}),
-		requestChannels: channels,
+		requestChannels: make([]requestChannelData, 0, len(configs)),
 		retryChannel:    make(chan api.RetryMessage),
 		resultChannel:   make(chan api.ResultMessage),
 		pollInterval:    time.Duration(*ssPollIntervalMs) * time.Millisecond,
 		batchSize:       *ssBatchSize,
 	}
 
+	// Apply functional options
 	for _, opt := range opts {
 		opt(r)
 	}
 
+	// Create per-queue channels with gates
+	for _, cfg := range configs {
+		// Determine gate for this queue
+		var gate api.DispatchGate
+		if r.gateFactory != nil && cfg.GateType != "" {
+			// Use factory to create per-queue gate
+			var err error
+			gate, err = r.gateFactory.CreateGate(cfg.GateType, cfg.GateParams)
+			if err != nil {
+				panic(fmt.Sprintf("failed to create gate for queue %q (gate_type=%q): %v", cfg.QueueName, cfg.GateType, err))
+			}
+		} else if r.gate != nil {
+			// Fall back to global gate if provided
+			gate = r.gate
+		} else {
+			// Default to always-open gate
+			gate = api.ConstOpenGate()
+		}
+
+		ch := api.RequestChannel{
+			Channel:            make(chan api.RequestMessage),
+			InferenceObjective: cfg.InferenceObjective,
+			RequestPathURL:     util.NormalizeURLPath(cfg.RequestPathURL),
+			IGWBaseURl:         util.NormalizeBaseURL(cfg.IGWBaseURl),
+			Gate:               gate,
+		}
+
+		r.requestChannels = append(r.requestChannels, requestChannelData{
+			channel:   ch,
+			queueName: cfg.QueueName,
+			gate:      gate,
+		})
+	}
+
+	// Set default gate if not already set
 	if r.gate == nil {
-		r.gate = flowcontrol.ConstOpenGate()
+		r.gate = api.ConstOpenGate()
 	}
 
 	return r
@@ -112,15 +150,18 @@ func loadQueueConfigs() []queueConfig {
 		}
 		var configs []queueConfig
 		if err := json.Unmarshal(data, &configs); err != nil {
-			panic(fmt.Sprintf("failed to unmarshal config: %v", err))
+			panic(fmt.Sprintf("failed to unmarshal config file: %v", err))
 		}
 		return configs
 	}
+	// Single-queue mode
 	return []queueConfig{{
 		QueueName:          *ssRequestQueueName,
 		InferenceObjective: *ssInferenceObjective,
 		RequestPathURL:     *ssRequestPathURL,
 		IGWBaseURl:         *ssIGWBaseURL,
+		GateType:           *ssGateType,
+		GateParams:         parseGateParams(*ssGateParamsJSON),
 	}}
 }
 
@@ -158,20 +199,32 @@ func (r *RedisSortedSetFlow) requestWorker(ctx context.Context, msgChannel chan 
 	ticker := time.NewTicker(r.pollInterval)
 	defer ticker.Stop()
 
+	// Find the gate for this queue
+	var gate api.DispatchGate
+	for _, ch := range r.requestChannels {
+		if ch.queueName == queueName {
+			gate = ch.gate
+			break
+		}
+	}
+	if gate == nil {
+		gate = r.gate
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r.processMessages(ctx, msgChannel, queueName, logger)
+			r.processMessages(ctx, msgChannel, queueName, gate, logger)
 		}
 	}
 }
 
-func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel chan api.RequestMessage, queueName string, logger logr.Logger) {
+func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel chan api.RequestMessage, queueName string, gate api.DispatchGate, logger logr.Logger) {
 	currentTime := float64(time.Now().Unix())
 
-	budget := r.gate.Budget(ctx)
+	budget := gate.Budget(ctx)
 	batchSize := int(math.Floor(float64(r.batchSize) * budget))
 
 	for i := 0; i < batchSize; i++ {

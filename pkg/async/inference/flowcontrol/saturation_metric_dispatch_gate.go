@@ -96,6 +96,7 @@ func SaturationGate() *SaturationMetricDispatchGate {
 		if err != nil {
 			panic(err)
 		}
+		return NewSaturationMetricDispatchGateWithSource(source, *saturationThreshold, *saturationFallback)
 	} else {
 		var err error
 		source, err = NewPromQLMetricSource(api.Config{
@@ -104,7 +105,6 @@ func SaturationGate() *SaturationMetricDispatchGate {
 		if err != nil {
 			panic(err)
 		}
+		return NewSaturationMetricDispatchGateWithSource(source, *saturationThreshold, *saturationFallback)
 	}
-
-	return NewSaturationMetricDispatchGateWithSource(source, *saturationThreshold, *saturationFallback)
 }

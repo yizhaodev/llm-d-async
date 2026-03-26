@@ -65,6 +65,15 @@ func NewPromQLMetricSource(clientConfig api.Config, expr string) (*PromQLMetricS
 	}, nil
 }
 
+// NewPromQLMetricSourceWithURL creates a MetricSource with a simple URL (no auth).
+// Use this for standard Prometheus or when the URL includes authentication details.
+func NewPromQLMetricSourceWithURL(url string) (*PromQLMetricSource, error) {
+	if url == "" {
+		return nil, fmt.Errorf("prometheus URL cannot be empty")
+	}
+	return NewPromQLMetricSource(api.Config{Address: url}, "")
+}
+
 // NewGMPPromQLMetricSource creates a PromQL MetricSource for Google Managed Prometheus.
 func NewGMPPromQLMetricSource(projectID string, expr string) (*PromQLMetricSource, error) {
 	ctx := context.Background()

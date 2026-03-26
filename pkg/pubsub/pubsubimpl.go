@@ -12,7 +12,6 @@ import (
 
 	"cloud.google.com/go/pubsub/v2"
 	"github.com/llm-d-incubation/llm-d-async/pkg/async/api"
-	"github.com/llm-d-incubation/llm-d-async/pkg/async/inference/flowcontrol"
 	"github.com/llm-d-incubation/llm-d-async/pkg/metrics"
 	"github.com/llm-d-incubation/llm-d-async/pkg/util"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -37,30 +36,35 @@ var (
 )
 
 type TopicConfig struct {
-	SubscriberID       string `json:"subscriber_id"`
-	InferenceObjective string `json:"inference_objective"`
-	RequestPathURL     string `json:"request_path_url"`
-	IGWBaseURl         string `json:"igw_base_url"`
+	SubscriberID       string            `json:"subscriber_id"`
+	InferenceObjective string            `json:"inference_objective"`
+	RequestPathURL     string            `json:"request_path_url"`
+	IGWBaseURl         string            `json:"igw_base_url"`
+	GateType           string            `json:"gate_type"`
+	GateParams         map[string]string `json:"gate_params,omitempty"`
 }
 type PubSubMQFlow struct {
 	resultTopicID   string
 	requestChannels []RequestChannelData
 	retryChannel    chan api.RetryMessage
 	resultChannel   chan api.ResultMessage
-	gate            flowcontrol.DispatchGate
+	gate            api.DispatchGate
+	gateFactory     api.GateFactory
 }
 type RequestChannelData struct {
 	requestChannel api.RequestChannel
 	subscriberID   string
+	gate           api.DispatchGate
 }
 
 // PubSubOption is a functional option for configuring PubSubMQFlow
 type PubSubOption func(*PubSubMQFlow)
 
-// WithDispatchGate enables dispatch gating with the provided gate.
-func WithDispatchGate(gate flowcontrol.DispatchGate) PubSubOption {
+// WithGateFactory sets a GateFactory for per-topic gate instantiation.
+// When set, gates are created per topic from config, overriding any global gate.
+func WithGateFactory(factory api.GateFactory) PubSubOption {
 	return func(p *PubSubMQFlow) {
-		p.gate = gate
+		p.gateFactory = factory
 	}
 }
 
@@ -86,35 +90,54 @@ func NewGCPPubSubMQFlow(opts ...PubSubOption) *PubSubMQFlow {
 	} else {
 		configs = []TopicConfig{{SubscriberID: *requestSubscriberID, IGWBaseURl: *igwBaseURL, InferenceObjective: *inferenceObjective, RequestPathURL: *requestPathURL}}
 	}
+	p := &PubSubMQFlow{
+		resultTopicID:   *resultTopicID,
+		requestChannels: make([]RequestChannelData, 0, len(configs)),
+		retryChannel:    make(chan api.RetryMessage),
+		resultChannel:   make(chan api.ResultMessage),
+	}
 
-	var channels []RequestChannelData
+	// Apply functional options
+	for _, opt := range opts {
+		opt(p)
+	}
+
+	// Create per-topic channels with gates
 	for _, cfg := range configs {
-		ch := make(chan api.RequestMessage)
+		// Determine gate for this topic
+		var gate api.DispatchGate
+		if p.gateFactory != nil && cfg.GateType != "" {
+			// Use factory to create per-topic gate
+			var err error
+			gate, err = p.gateFactory.CreateGate(cfg.GateType, cfg.GateParams)
+			if err != nil {
+				panic(fmt.Sprintf("failed to create gate for topic subscriber %q (gate_type=%q): %v", cfg.SubscriberID, cfg.GateType, err))
+			}
+		} else if p.gate != nil {
+			// Fall back to global gate if provided
+			gate = p.gate
+		} else {
+			// Default to always-open gate
+			gate = api.ConstOpenGate()
+		}
 
-		channels = append(channels, RequestChannelData{
+		ch := make(chan api.RequestMessage)
+		p.requestChannels = append(p.requestChannels, RequestChannelData{
 			requestChannel: api.RequestChannel{
 				Channel:            ch,
 				IGWBaseURl:         util.NormalizeBaseURL(cfg.IGWBaseURl),
 				InferenceObjective: cfg.InferenceObjective,
 				RequestPathURL:     util.NormalizeURLPath(cfg.RequestPathURL),
+				Gate:               gate,
 			},
 			subscriberID: cfg.SubscriberID,
+			gate:         gate,
 		})
 	}
 
-	p := &PubSubMQFlow{
-		resultTopicID:   *resultTopicID,
-		requestChannels: channels,
-		retryChannel:    make(chan api.RetryMessage),
-		resultChannel:   make(chan api.ResultMessage),
-	}
-
-	for _, opt := range opts {
-		opt(p)
-	}
-
+	// Set default gate if not already set
 	if p.gate == nil {
-		p.gate = flowcontrol.ConstOpenGate()
+		p.gate = api.ConstOpenGate()
 	}
 
 	return p
@@ -146,7 +169,7 @@ func (r *PubSubMQFlow) RequestChannels() []api.RequestChannel {
 
 func (r *PubSubMQFlow) Start(ctx context.Context) {
 	for _, channelData := range r.requestChannels {
-		go r.requestWorker(ctx, pubSubClient, channelData.subscriberID, channelData.requestChannel.Channel)
+		go r.requestWorker(ctx, pubSubClient, channelData.subscriberID, channelData.requestChannel.Channel, channelData.gate)
 	}
 	publisher := pubSubClient.Publisher(r.resultTopicID)
 	go resultWorker(ctx, publisher, r.resultChannel)
@@ -208,14 +231,14 @@ func addMsgToRetryQueue(ctx context.Context, retryChannel chan api.RetryMessage)
 
 }
 
-func (r *PubSubMQFlow) requestWorker(ctx context.Context, pubSubClient *pubsub.Client, subscriberID string, ch chan api.RequestMessage) {
+func (r *PubSubMQFlow) requestWorker(ctx context.Context, pubSubClient *pubsub.Client, subscriberID string, ch chan api.RequestMessage, gate api.DispatchGate) {
 	logger := log.FromContext(ctx)
 
 	sub := pubSubClient.Subscriber(subscriberID)
 
 	for {
 		receiveCtx, cancel := context.WithCancel(ctx)
-		budget := r.gate.Budget(ctx)
+		budget := gate.Budget(ctx)
 		go func() {
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
@@ -223,7 +246,7 @@ func (r *PubSubMQFlow) requestWorker(ctx context.Context, pubSubClient *pubsub.C
 			for {
 				select {
 				case <-ticker.C:
-					if r.gate.Budget(ctx) != budget {
+					if gate.Budget(ctx) != budget {
 						cancel() // Trigger restart with different limit
 						return
 					}

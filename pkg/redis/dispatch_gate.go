@@ -2,7 +2,6 @@ package redis
 
 import (
 	"context"
-	"flag"
 	"strconv"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -10,9 +9,7 @@ import (
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/util/logging"
 )
 
-var dispatchGateBudgetKey = flag.String("redis.dispatch-gate-budget-key", "dispatch-gate-budget", "Redis key for dispatch gate budget value")
-
-// RedisDispatchGate implements flowcontrol.DispatchGate by reading the budget
+// RedisDispatchGate implements api.DispatchGate by reading the budget
 // from a Redis key. This allows external systems to dynamically control
 // the dispatch rate. If the key does not exist or is invalid, it defaults
 // to full capacity (1.0).
@@ -22,12 +19,11 @@ type RedisDispatchGate struct {
 }
 
 // NewRedisDispatchGate creates a new RedisDispatchGate that reads budget
-// from the configured Redis key. It connects to the same Redis instance
-// as the sorted set flow (--redis.ss.addr).
-func NewRedisDispatchGate() *RedisDispatchGate {
+// from the given Redis client and budget key.
+func NewRedisDispatchGate(client *goredis.Client, budgetKey string) *RedisDispatchGate {
 	return &RedisDispatchGate{
-		rdb: goredis.NewClient(&goredis.Options{Addr: *ssRedisAddr}),
-		key: *dispatchGateBudgetKey,
+		rdb: client,
+		key: budgetKey,
 	}
 }
 

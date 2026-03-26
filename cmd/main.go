@@ -33,7 +33,6 @@ func main() {
 	var concurrency int
 	var requestMergePolicy string
 	var messageQueueImpl string
-	var dispatchGateType string
 
 	flag.IntVar(&loggerVerbosity, "v", logging.DEFAULT, "number for the log level verbosity")
 
@@ -43,8 +42,9 @@ func main() {
 	flag.IntVar(&concurrency, "concurrency", 8, "number of concurrent workers")
 
 	flag.StringVar(&requestMergePolicy, "request-merge-policy", "random-robin", "The request merge policy to use. Supported policies: random-robin")
-	flag.StringVar(&dispatchGateType, "dispatch-gate", "noop", "The dispatch gate policy to use. Supported policies: noop, redis, metric-avg-queue-size, metric-saturation")
-	flag.StringVar(&messageQueueImpl, "message-queue-impl", "redis-pubsub", "The message queue implementation to use. Supported implementations: redis-pubsub, redis-sortedset, redis-sortedset-gated, gcp-pubsub, gcp-pubsub-gated")
+	flag.StringVar(&messageQueueImpl, "message-queue-impl", "redis-pubsub", "The message queue implementation to use. Supported implementations: redis-pubsub, redis-sortedset, gcp-pubsub, gcp-pubsub-gated")
+
+	var prometheusURL = flag.String("prometheus-url", "", "Prometheus server URL for metric-based gates (e.g., http://localhost:9090)")
 
 	opts := zap.Options{
 		Development: true,
@@ -62,23 +62,8 @@ func main() {
 	////////setupLog.Info("GIE build", "commit-sha", version.CommitSHA, "build-ref", version.BuildRef)
 
 	printAllFlags(setupLog)
-	// Create dispatch gate
-	var gate flowcontrol.DispatchGate
-	switch dispatchGateType {
-	case "noop":
-		gate = flowcontrol.ConstOpenGate()
-	case "redis":
-		gate = redis.NewRedisDispatchGate()
-		setupLog.Info("Using Redis-based dispatch gate")
-	case "metric-avg-queue-size":
-		gate = flowcontrol.AverageQueueSizeGate()
-	case "metric-saturation":
-		gate = flowcontrol.SaturationGate()
-		setupLog.Info("Using saturation metric dispatch gate")
-	default:
-		setupLog.Error(fmt.Errorf("unknown dispatch gate type: %s", dispatchGateType), "Unknown dispatch gate type", "dispatch-gate", dispatchGateType)
-		os.Exit(1)
-	}
+	// Create Gate Factory for per-queue gate instantiation
+	gateFactory := flowcontrol.NewGateFactory(*prometheusURL)
 
 	var policy api.RequestMergePolicy
 	switch requestMergePolicy {
@@ -94,17 +79,14 @@ func main() {
 	case "redis-pubsub":
 		impl = redis.NewRedisMQFlow()
 	case "redis-sortedset":
-		impl = redis.NewRedisSortedSetFlow()
-	case "redis-sortedset-gated":
-		impl = redis.NewRedisSortedSetFlow(redis.WithDispatchGate(gate))
-		setupLog.Info("Using Redis sorted-set flow with dispatch gating", "gate-type", dispatchGateType)
+		impl = redis.NewRedisSortedSetFlow(redis.WithGateFactory(gateFactory))
+		setupLog.Info("Using Redis sorted-set flow with per-queue gating")
 	case "gcp-pubsub":
 		impl = pubsub.NewGCPPubSubMQFlow()
 	case "gcp-pubsub-gated":
-		impl = pubsub.NewGCPPubSubMQFlow(pubsub.WithDispatchGate(gate))
-		setupLog.Info("Using GCP PubSub flow with dispatch gating", "gate-type", dispatchGateType)
+		impl = pubsub.NewGCPPubSubMQFlow(pubsub.WithGateFactory(gateFactory))
+		setupLog.Info("Using GCP PubSub flow with per-queue gating")
 	default:
-
 		setupLog.Error(fmt.Errorf("unknown message queue implementation: %s", messageQueueImpl), "Unknown message queue implementation",
 			"message-queue-impl", messageQueueImpl)
 		os.Exit(1)

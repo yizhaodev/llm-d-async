@@ -27,26 +27,29 @@ The architecture adheres to the following core principles:
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [When to use](#when-to-use)
-- [Design Principles](#design-principles)
-- [Deployment](#deployment)
-- [Command line parameters](#command-line-parameters)
-- [Request Messages and Consusmption](#request-messages-and-consomption)
+- [Async Processor (AP) - User Guide](#async-processor-ap---user-guide)
+  - [Overview](#overview)
+  - [When to Use](#when-to-use)
+  - [Design Principles](#design-principles)
+  - [Table of Contents](#table-of-contents)
+  - [Deployment](#deployment)
+  - [Command line parameters](#command-line-parameters)
+  - [Dispatch Gates](#dispatch-gates)
+    - [Per-Queue Dispatch Gates](#per-queue-dispatch-gates)
+  - [Request Messages and Consumption](#request-messages-and-consumption)
     - [Request Merge Policy](#request-merge-policy)
-- [Retries](#retries)
-- [Results](#results)   
-- [Implementations](#implementations)
+  - [Retries](#retries)
+  - [Results](#results)
+  - [Implementations](#implementations)
     - [Redis Sorted Set (Persisted)](#redis-sorted-set-persisted)
       - [Redis Sorted Set Command line parameters](#redis-sorted-set-command-line-parameters)
-    - [Redis Channels (Ephemeral)](#redis-channels)
+    - [Redis Channels (Ephemeral)](#redis-channels-ephemeral)
       - [Redis Channels Command line parameters](#redis-channels-command-line-parameters)
-        - [Multiple Queues Configuration File Syntax](#multiple-queues-configuration-file-syntax)
-    - [GCP Pub/Sub](#gcp-pub-sub)
+      - [Multiple Queues Configuration File Syntax](#multiple-queues-configuration-file-syntax)
+    - [GCP Pub/Sub](#gcp-pubsub)
       - [GCP PubSub Command line parameters](#gcp-pubsub-command-line-parameters)
-        - [Multiple Topics Configuration File Syntax](#multiple-topics-configuration-file-syntax)
-- [Development](#development)
-
+      - [Multiple Topics Configuration File Syntax](#multiple-topics-configuration-file-syntax)
+  - [Development](#development)
 
 ## Deployment
 
@@ -78,18 +81,76 @@ make deploy-ap-on-k8s
 ## Command line parameters
 - `concurrency`: The number of concurrenct workers, default is 8.
 - `request-merge-policy`: Currently only supporting <u>random-robin</u> policy.
-- `message-queue-impl`: Implementation of the queueing system. Options are <u>gcp-pubsub</u> for GCP PubSub <u>redis-sortedset</u> for Redis Sorted Set (persisted and sorted) and  <u>redis-pubsub</u> for ephemeral Redis-based implementation.
-- `dispatch-gate`: Implementation of a dispatcher that is responsible for gating pulling messages from the queues. Options are :
-   - `noop`: The default. Represents full availability of the system. Always pulling messages.
-   - `metric-avg-queue-size`: Availability base on the model average queue size metric in Prometheus. If the queue size is non empty, messages will not be pulled from the respective queue.
-   - `redis`: Availability of the system is pulled periodically from Redis (I.e., managed by external system).
+- `message-queue-impl`: Implementation of the queueing system. Options are <u>gcp-pubsub</u> for GCP PubSub, <u>gcp-pubsub-gated</u> for GCP PubSub with per-topic gating, <u>redis-sortedset</u> for Redis Sorted Set (persisted and sorted), and <u>redis-pubsub</u> for ephemeral Redis-based implementation.
+
+ - `prometheus-url`: Prometheus server URL for metric-based gates (e.g., http://localhost:9090). For Google Managed Prometheus (GMP), point this to a local proxy or GMP frontend that handles authentication — direct GMP URLs are not supported as the Async Processor does not perform GMP authentication.  
+   This flag is required when using metric-based per-queue gates (e.g., `prometheus-saturation`).
 
 <i>additional parameters may be specified for concrete message queue implementations</i>
 
+## Dispatch Gates
 
-## Request Messages and Consusmption
+The Async Processor supports dispatch gates to control batch processing based on system capacity. Gates can be configured per-queue (via configuration files).
+
+### Per-Queue Dispatch Gates
+
+For more fine-grained control, configure gates per queue in your configuration file. Each queue can have its own gate type and parameters.
+
+**Gate Types:**
+
+- `constant`: Always returns budget 1.0 (fully open) - no throttling.
+- `redis`: Queries Redis for dispatch budget (managed by external system).
+- `prometheus-saturation`: Queries Prometheus for pool saturation metric. Returns 1.0 - saturation if below threshold, 0.0 otherwise.
+
+**Example Configuration with Per-Queue Gates:**
+
+```json
+[
+    {
+       "queue_name": "critical_queue",
+       "inference_objective": "critical-task",
+       "request_path_url": "/v1/inference",
+       "gate_type": "constant"
+    },
+    {
+       "queue_name": "batch_queue",
+       "inference_objective": "batch-task",
+       "request_path_url": "/v1/inference",
+       "gate_type": "prometheus-saturation",
+       "gate_params": {
+          "pool": "inference_pool_1",
+          "threshold": "0.8"
+       }
+    },
+    {
+       "queue_name": "redis_gated_queue",
+       "inference_objective": "gated-task",
+       "request_path_url": "/v1/inference",
+       "gate_type": "redis",
+       "gate_params": {
+          "address": "localhost:6379",
+          "budget_key": "my-budget-key"
+       }
+    }
+]
+```
+
+**Gate Parameters:**
+
+- `redis`:
+  - `address` (**required**): Redis server address for the dispatch gate (e.g., `localhost:6379`). Queues sharing the same address will share the same connection pool.
+  - `budget_key` (optional): Redis key to read dispatch budget from. Default is `dispatch-gate-budget`.
+
+- `prometheus-saturation`:
+  - `pool`: The inference pool name to query metrics for.
+  - `threshold`: Saturation threshold (0.0-1.0). When saturation >= threshold, budget is 0.0. Default is 0.8.
+  - `fallback`: Fallback saturation value (0.0-1.0) used when the metric source returns an error or empty data. Default is 0.0.
+  - `query`: Custom PromQL expression to query. If omitted, a default query using `inference_extension_flow_control_pool_saturation` with the `pool` label is used.
+
+## Request Messages and Consumption
 
 The async processor expects request messages to have the following format:
+
 ```json
 {
     "id" : "unique identifier for result mapping",
@@ -100,6 +161,7 @@ The async processor expects request messages to have the following format:
 ```
 
 Example:
+
 ```json
 {
     "id" : "19933123533434",
@@ -141,7 +203,6 @@ A persisted implementation based on Redis SortedSets.
 
 ![Async Processor - Redis Sorted Set architecture](/docs/images/redis_sortedset_architecture.png "AP - Redis SortedSet")
 
-
 #### Redis Sorted Set Command line parameters
 - `redis.ss.addr`: Address of the Redis server. Default is <u>localhost:6379</u>.
 - `redis.ss.igw-base-url`: Base URL of the IGW (e.g. https://localhost:30800).<br> Mutually exclusive with `redis.ss.queues-config-file` flag.
@@ -152,6 +213,8 @@ A persisted implementation based on Redis SortedSets.
 - `redis.ss.queues-config-file`: The configuration file name when using multiple queues. <br> Mutually exclusive with `redis.ss.igw-base-url`, `redis.ss.request-queue-name`, `redis.ss.request-path-url` and `redis.ss.inference-objective` flags.
 - `redis.ss.poll-interval-ms`: Poll interval in milliseconds. Default is <u>1000</u>.
 - `redis.ss.batch-size`: Number of messages to process per poll. Default is <u>10</u>.
+- `redis.ss.gate-type`: Gate type for single-queue mode (e.g., `redis`, `prometheus-saturation`). Only used when `redis.ss.queues-config-file` is not set.
+- `redis.ss.gate-params`: JSON-encoded gate params map for single-queue mode (e.g., `{"address":"localhost:6379"}`). Only used when `redis.ss.queues-config-file` is not set.
 
 ### Redis Channels (Ephemeral)
 
@@ -182,19 +245,31 @@ An example implementation based on Redis channels is provided.
 
 The configuration file when using the `redis.queues-config-file` flag should have the following format:
 
-```json 
+```json
 [
     {
-       "queue_name": "some_channel_name", 
+       "queue_name": "some_queue_name",
        "igw_base_url": "http://localhost:30800",
-       "inference_objective": "some_inference_objective", 
-       "request_path_url": "e.g.: /v1/completions"
+       "inference_objective": "some_inference_objective",
+       "request_path_url": "/v1/completions"
     },
-    ...
+    {
+       "queue_name": "another_queue",
+       "igw_base_url": "http://localhost:30800",
+       "inference_objective": "batch_task",
+       "request_path_url": "/v1/inference"
+    }
 ]
 ```
 
+<u>Note:</u> The ephemeral Redis Channels implementation does not support per-queue dispatch gates. Use the [Redis Sorted Set](#redis-sorted-set-persisted) implementation for per-queue gating.
 
+**Configuration Fields:**
+
+- `queue_name`: The name of the Redis channel for this queue.
+- `igw_base_url`: Base URL of the IGW.
+- `inference_objective`: The inference objective header value.
+- `request_path_url`: The request path URL.
 
 ### GCP Pub/Sub
 
@@ -218,28 +293,49 @@ The GCP PubSub implementation requires the user to configure the following:
 - `pubsub.inference-objective`: InferenceObjective to use for requests (set as the HTTP header x-gateway-inference-objective if not empty). <br> Mutually exclusive with `pubsub.topics-config-file` flag.
 - `pubsub.request-subscriber-id`: The subscriber ID for the requests topic.<br> Mutually exclusive with `pubsub.topics-config-file` flag.
 - `pubsub.result-topic-id`: The results topic ID.
+- `pubsub.batch-size`: Number of inflight messages. Default is <u>10</u>.
 - `pubsub.topics-config-file`: The configuration file name when using multiple topics. <br> Mutually exclusive with `pubsub.request-subscriber-id`, `pubsub.request-path-url` and `pubsub.inference-objective` flags.
 
 #### Multiple Topics Configuration File Syntax
 
 The configuration file when using the `pubsub.topics-config-file` flag should have the following format:
 
-```json 
+```json
 [
     {
        "igw_base_url": "http://localhost:30800",
-       "subscriber_id": "some_subscriber_id", 
-       "inference_objective": "some_inference_objective", 
-       "request_path_url": "e.g.: /v1/completions"
+       "subscriber_id": "some_subscriber_id",
+       "inference_objective": "some_inference_objective",
+       "request_path_url": "e.g.: /v1/completions",
+       "gate_type": "constant",
+       "gate_params": {}
     },
-    ...
+    {
+       "subscriber_id": "another_subscriber",
+       "inference_objective": "batch_task",
+       "request_path_url": "/v1/inference",
+       "gate_type": "prometheus-saturation",
+       "gate_params": {
+           "pool": "pool_2",
+           "threshold": "0.75"
+       }
+    }
 ]
 ```
+
+**Configuration Fields:**
+
+- `subscriber_id`: The GCP PubSub subscriber ID for this topic.
+- `inference_objective`: The inference objective header value.
+- `request_path_url`: The request path URL.
+- `gate_type`: Required type of dispatch gate for this topic.
+- `gate_params` (optional): Parameters for the gate type (e.g., pool name, threshold for prometheus gates).
 
 ## Development
 
 A setup based on a KIND cluster with a Redis server for MQ is provided.
 In order to deploy everything run:
+
 ```bash
 make deploy-ap-emulated-on-kind
 ```
@@ -251,7 +347,7 @@ kubectl exec -n redis redis-master-0 -- redis-cli SUBSCRIBE result-queue
 ```
 
 Publish a message for async processing:
+
 ```bash
 kubectl exec -n redis redis-master-0 -- redis-cli PUBLISH request-queue '{"id" : "testmsg", "payload":{ "model":"unsloth/Meta-Llama-3.1-8B", "prompt":"hi"}, "deadline" :"9999999999" }'
 ```
-

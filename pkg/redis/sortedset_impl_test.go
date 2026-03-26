@@ -12,13 +12,12 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/llm-d-incubation/llm-d-async/pkg/async/api"
-	"github.com/llm-d-incubation/llm-d-async/pkg/async/inference/flowcontrol"
 	"github.com/redis/go-redis/v9"
 )
 
 // noopGate returns a gate that always returns full budget (1.0)
-func noopGate() flowcontrol.DispatchGate {
-	return flowcontrol.ConstOpenGate()
+func noopGate() api.DispatchGate {
+	return api.ConstOpenGate()
 }
 
 // Test helper to create test flow and Redis
@@ -435,7 +434,7 @@ func TestSortedSetFlow_ZeroBudget(t *testing.T) {
 	var budgetValue atomic.Uint64 // Store as bits to represent float64
 
 	budgetValue.Store(math.Float64bits(0.0))
-	gate := flowcontrol.DispatchGateFunc(func(ctx context.Context) float64 {
+	gate := api.DispatchGateFunc(func(ctx context.Context) float64 {
 		return math.Float64frombits(budgetValue.Load())
 	})
 
@@ -499,7 +498,7 @@ func TestSortedSetFlow_PartialBudget(t *testing.T) {
 	queue := "partial-budget-queue"
 
 	// Gate with 30% budget - should process floor(10*0.3)=3 messages per cycle
-	gate := flowcontrol.DispatchGateFunc(func(ctx context.Context) float64 {
+	gate := api.DispatchGateFunc(func(ctx context.Context) float64 {
 		return 0.3
 	})
 
@@ -535,40 +534,5 @@ func TestSortedSetFlow_PartialBudget(t *testing.T) {
 	remaining, _ := rdb.ZCard(ctx, queue).Result()
 	if remaining != 7 {
 		t.Errorf("Expected 7 messages remaining with 30%% budget (3 pulled), got %d remaining", remaining)
-	}
-}
-
-func TestSortedSetFlow_WithDispatchGateOption(t *testing.T) {
-	s, rdb, ctx, cancel := setupTest(t)
-	defer s.Close()
-	defer rdb.Close() // nolint:errcheck
-	defer cancel()
-
-	queue := "option-test-queue"
-	origQueue := *ssRequestQueueName
-	*ssRequestQueueName = queue
-	defer func() { *ssRequestQueueName = origQueue }()
-
-	// Use WithDispatchGate option
-	gate := flowcontrol.ConstOpenGate()
-
-	flow := NewRedisSortedSetFlow(WithDispatchGate(gate))
-	flow.rdb = rdb
-	flow.pollInterval = 50 * time.Millisecond
-
-	flow.Start(ctx)
-
-	// Add message
-	msg := api.RequestMessage{Id: "option-test", CreatedUnixSec: strconv.FormatInt(time.Now().Unix(), 10), DeadlineUnixSec: "9999999999"}
-	msgBytes, _ := json.Marshal(msg)
-	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: string(msgBytes)})
-
-	select {
-	case received := <-flow.RequestChannels()[0].Channel:
-		if received.Id != "option-test" {
-			t.Errorf("Expected option-test, got %s", received.Id)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Timeout waiting for message with WithDispatchGate option")
 	}
 }

@@ -16,18 +16,11 @@ limitations under the License.
 
 package flowcontrol
 
-import "context"
+import (
+	"context"
 
-// DispatchGate defines the interface to determine whether there is enough capacity to forward a request.
-type DispatchGate interface {
-	// Budget returns the Dispatch Budget in the range [0.0, 1.0], representing
-	// the fraction of system capacity available for new requests.
-	// A value of 0.0 indicates no available capacity (system at max allowed).
-	// A value of 1.0 indicates full capacity available (system is idle).
-	// Implementations must always return a value in [0.0, 1.0], even in case
-	// of internal error.
-	Budget(ctx context.Context) float64
-}
+	"github.com/llm-d-incubation/llm-d-async/pkg/async/api"
+)
 
 // DispatchGateFunc is a function type that implements DispatchGate.
 // This allows any function with the signature func(context.Context) float64
@@ -39,6 +32,6 @@ func (f DispatchGateFunc) Budget(ctx context.Context) float64 {
 	return f(ctx)
 }
 
-func ConstOpenGate() DispatchGate {
+func ConstOpenGate() api.DispatchGate {
 	return DispatchGateFunc(func(ctx context.Context) float64 { return 1.0 })
 }
