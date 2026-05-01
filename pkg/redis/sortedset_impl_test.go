@@ -28,6 +28,13 @@ func setupTest(t *testing.T) (*miniredis.Miniredis, *redis.Client, context.Conte
 	return s, rdb, ctx, cancel
 }
 
+// envelopeJSON marshals a RequestMessage as the tagged envelope format.
+func envelopeJSON(rm api.RequestMessage) string {
+	ir := api.NewInternalRequest(api.InternalRouting{}, &rm)
+	b, _ := json.Marshal(ir)
+	return string(b)
+}
+
 func TestSortedSetFlow_MessageProcessing(t *testing.T) {
 	s, rdb, ctx, cancel := setupTest(t)
 	defer s.Close()
@@ -38,7 +45,7 @@ func TestSortedSetFlow_MessageProcessing(t *testing.T) {
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
 		requestChannels: []requestChannelData{{
-			channel:   api.RequestChannel{Channel: make(chan api.RequestMessage)},
+			channel:   api.RequestChannel{Channel: make(chan *api.InternalRequest)},
 			queueName: queue,
 		}},
 		pollInterval: 50 * time.Millisecond,
@@ -48,23 +55,22 @@ func TestSortedSetFlow_MessageProcessing(t *testing.T) {
 
 	// Add message with valid deadline
 	msg := api.RequestMessage{
-		Id:              "msg-1",
-		CreatedUnixSec:  strconv.FormatInt(time.Now().Unix(), 10),
-		DeadlineUnixSec: "9999999999",
-		Payload:         map[string]any{"test": "data"},
+		ID:       "msg-1",
+		Created:  time.Now().Unix(),
+		Deadline: 9999999999,
+		Payload:  map[string]any{"test": "data"},
 	}
-	msgBytes, _ := json.Marshal(msg)
-	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: string(msgBytes)})
+	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: envelopeJSON(msg)})
 
 	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue)
 
 	select {
 	case received := <-flow.requestChannels[0].channel.Channel:
-		if received.Id != "msg-1" {
-			t.Errorf("Expected msg-1, got %s", received.Id)
+		if received.PublicRequest == nil || received.PublicRequest.ReqID() != "msg-1" {
+			t.Errorf("Expected msg-1, got %v", received.PublicRequest)
 		}
-		if received.Metadata[SORTEDSET_QUEUE_NAME_KEY] != queue {
-			t.Error("Queue name not set in metadata")
+		if received.RequestQueueName != queue {
+			t.Error("Queue name not set in InternalRouting")
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("Timeout waiting for message")
@@ -101,19 +107,18 @@ func TestSortedSetFlow_DeadlineOrdering(t *testing.T) {
 	}
 
 	for _, m := range messages {
-		msg := api.RequestMessage{Id: m.id, CreatedUnixSec: strconv.FormatInt(time.Now().Unix(), 10), DeadlineUnixSec: strconv.FormatInt(m.deadline, 10)}
-		msgBytes, _ := json.Marshal(msg)
-		rdb.ZAdd(ctx, queue, redis.Z{Score: float64(m.deadline), Member: string(msgBytes)})
+		msg := api.RequestMessage{ID: m.id, Created: time.Now().Unix(), Deadline: m.deadline}
+		rdb.ZAdd(ctx, queue, redis.Z{Score: float64(m.deadline), Member: envelopeJSON(msg)})
 	}
 
-	msgChannel := make(chan api.RequestMessage, 10)
+	msgChannel := make(chan *api.InternalRequest, 10)
 	go flow.requestWorker(ctx, msgChannel, queue)
 
 	var processed []string
 	for i := 0; i < 3; i++ {
 		select {
 		case msg := <-msgChannel:
-			processed = append(processed, msg.Id)
+			processed = append(processed, msg.PublicRequest.ReqID())
 		case <-time.After(1 * time.Second):
 			t.Fatal("Timeout")
 		}
@@ -137,7 +142,7 @@ func TestSortedSetFlow_ExpiredMessages(t *testing.T) {
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
 		requestChannels: []requestChannelData{{
-			channel:   api.RequestChannel{Channel: make(chan api.RequestMessage)},
+			channel:   api.RequestChannel{Channel: make(chan *api.InternalRequest)},
 			queueName: queue,
 		}},
 		pollInterval: 50 * time.Millisecond,
@@ -146,15 +151,14 @@ func TestSortedSetFlow_ExpiredMessages(t *testing.T) {
 	}
 
 	pastDeadline := time.Now().Unix() - 100
-	msg := api.RequestMessage{Id: "expired", CreatedUnixSec: strconv.FormatInt(time.Now().Unix(), 10), DeadlineUnixSec: strconv.FormatInt(pastDeadline, 10)}
-	msgBytes, _ := json.Marshal(msg)
-	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(pastDeadline), Member: string(msgBytes)})
+	msg := api.RequestMessage{ID: "expired", Created: time.Now().Unix(), Deadline: pastDeadline}
+	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(pastDeadline), Member: envelopeJSON(msg)})
 
 	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue)
 
 	select {
 	case msg := <-flow.requestChannels[0].channel.Channel:
-		t.Fatalf("Should not receive expired message: %s", msg.Id)
+		t.Fatalf("Should not receive expired message: %s", msg.PublicRequest.ReqID())
 	case <-time.After(300 * time.Millisecond):
 		// Expected - message expired
 	}
@@ -175,7 +179,7 @@ func TestSortedSetFlow_MalformedMessages(t *testing.T) {
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
 		requestChannels: []requestChannelData{{
-			channel:   api.RequestChannel{Channel: make(chan api.RequestMessage)},
+			channel:   api.RequestChannel{Channel: make(chan *api.InternalRequest)},
 			queueName: queue,
 		}},
 		pollInterval: 50 * time.Millisecond,
@@ -197,17 +201,16 @@ func TestSortedSetFlow_MalformedMessages(t *testing.T) {
 	}
 
 	// Add valid message after malformed ones
-	validMsg := api.RequestMessage{Id: "valid", CreatedUnixSec: strconv.FormatInt(time.Now().Unix(), 10), DeadlineUnixSec: "9999999999"}
-	validBytes, _ := json.Marshal(validMsg)
-	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: string(validBytes)})
+	validMsg := api.RequestMessage{ID: "valid", Created: time.Now().Unix(), Deadline: 9999999999}
+	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: envelopeJSON(validMsg)})
 
 	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue)
 
 	// Should skip malformed and receive valid message
 	select {
 	case msg := <-flow.requestChannels[0].channel.Channel:
-		if msg.Id != "valid" {
-			t.Errorf("Expected valid message, got %s", msg.Id)
+		if msg.PublicRequest == nil || msg.PublicRequest.ReqID() != "valid" {
+			t.Errorf("Expected valid message, got %v", msg.PublicRequest)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Timeout - malformed messages might be blocking")
@@ -233,13 +236,14 @@ func TestSortedSetFlow_RetryBackoff(t *testing.T) {
 
 	retryMsg := api.RetryMessage{
 		EmbelishedRequestMessage: api.EmbelishedRequestMessage{
-			RequestMessage: api.RequestMessage{
-				Id:              "retry-1",
-				CreatedUnixSec:  strconv.FormatInt(time.Now().Unix(), 10),
-				DeadlineUnixSec: "9999999999",
-				RetryCount:      1,
-			},
-			Metadata: map[string]string{SORTEDSET_QUEUE_NAME_KEY: queue},
+			InternalRequest: api.NewInternalRequest(
+				api.InternalRouting{RetryCount: 1, RequestQueueName: queue},
+				&api.RequestMessage{
+					ID:       "retry-1",
+					Created:  time.Now().Unix(),
+					Deadline: 9999999999,
+				},
+			),
 		},
 		BackoffDurationSeconds: 2.0,
 	}
@@ -279,8 +283,8 @@ func TestSortedSetFlow_ResultFIFO(t *testing.T) {
 
 	go flow.resultWorker(ctx)
 
-	flow.resultChannel <- api.ResultMessage{Id: "first", Payload: "result1"}
-	flow.resultChannel <- api.ResultMessage{Id: "second", Payload: "result2"}
+	flow.resultChannel <- api.ResultMessage{ID: "first", Payload: "result1"}
+	flow.resultChannel <- api.ResultMessage{ID: "second", Payload: "result2"}
 	time.Sleep(100 * time.Millisecond)
 
 	// RPOP should get FIFO order
@@ -291,8 +295,8 @@ func TestSortedSetFlow_ResultFIFO(t *testing.T) {
 	json.Unmarshal([]byte(first), &msg1)  // nolint:errcheck
 	json.Unmarshal([]byte(second), &msg2) // nolint:errcheck
 
-	if msg1.Id != "first" || msg2.Id != "second" {
-		t.Errorf("FIFO order broken: got %s, %s", msg1.Id, msg2.Id)
+	if msg1.ID != "first" || msg2.ID != "second" {
+		t.Errorf("FIFO order broken: got %s, %s", msg1.ID, msg2.ID)
 	}
 }
 
@@ -320,7 +324,7 @@ func TestSortedSetFlow_ResultBatch(t *testing.T) {
 	numMessages := 10
 	for i := 0; i < numMessages; i++ {
 		flow.resultChannel <- api.ResultMessage{
-			Id:      "batch-" + strconv.Itoa(i),
+			ID:      "batch-" + strconv.Itoa(i),
 			Payload: "data-" + strconv.Itoa(i),
 		}
 	}
@@ -343,8 +347,8 @@ func TestSortedSetFlow_ResultBatch(t *testing.T) {
 		var msg api.ResultMessage
 		json.Unmarshal([]byte(raw), &msg) // nolint:errcheck
 		expected := "batch-" + strconv.Itoa(i)
-		if msg.Id != expected {
-			t.Errorf("Position %d: expected %s, got %s", i, expected, msg.Id)
+		if msg.ID != expected {
+			t.Errorf("Position %d: expected %s, got %s", i, expected, msg.ID)
 		}
 	}
 }
@@ -370,17 +374,17 @@ func TestSortedSetFlow_ResultBatchMultiQueue(t *testing.T) {
 	}
 
 	// Send messages targeting different queues in a single batch.
-	flow.resultChannel <- api.ResultMessage{Id: "default-1", Payload: "d1"}
+	flow.resultChannel <- api.ResultMessage{ID: "default-1", Payload: "d1"}
 	flow.resultChannel <- api.ResultMessage{
-		Id:       "custom-1",
-		Payload:  "c1",
-		Metadata: map[string]string{"result_queue": customQueue},
+		ID:      "custom-1",
+		Payload: "c1",
+		Routing: api.InternalRouting{ResultQueueName: customQueue},
 	}
-	flow.resultChannel <- api.ResultMessage{Id: "default-2", Payload: "d2"}
+	flow.resultChannel <- api.ResultMessage{ID: "default-2", Payload: "d2"}
 	flow.resultChannel <- api.ResultMessage{
-		Id:       "custom-2",
-		Payload:  "c2",
-		Metadata: map[string]string{"result_queue": customQueue},
+		ID:      "custom-2",
+		Payload: "c2",
+		Routing: api.InternalRouting{ResultQueueName: customQueue},
 	}
 
 	go flow.resultWorker(ctx)
@@ -409,9 +413,8 @@ func TestSortedSetFlow_NoRaceCondition(t *testing.T) {
 	numMessages := 20
 
 	for i := 0; i < numMessages; i++ {
-		msg := api.RequestMessage{Id: string(rune('A' + i)), CreatedUnixSec: strconv.FormatInt(time.Now().Unix(), 10), DeadlineUnixSec: "9999999999"}
-		msgBytes, _ := json.Marshal(msg)
-		rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: string(msgBytes)})
+		msg := api.RequestMessage{ID: string(rune('A' + i)), Created: time.Now().Unix(), Deadline: 9999999999}
+		rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: envelopeJSON(msg)})
 	}
 
 	var wg sync.WaitGroup
@@ -420,7 +423,7 @@ func TestSortedSetFlow_NoRaceCondition(t *testing.T) {
 	for w := 0; w < 3; w++ {
 		wg.Add(1)
 		flow := &RedisSortedSetFlow{rdb: rdb, pollInterval: 20 * time.Millisecond, batchSize: 10, gate: noopGate()}
-		msgChan := make(chan api.RequestMessage, 10)
+		msgChan := make(chan *api.InternalRequest, 10)
 
 		go func() {
 			defer wg.Done()
@@ -430,7 +433,7 @@ func TestSortedSetFlow_NoRaceCondition(t *testing.T) {
 			for {
 				select {
 				case msg := <-msgChan:
-					processed <- msg.Id
+					processed <- msg.PublicRequest.ReqID()
 				case <-workerCtx.Done():
 					return
 				}
@@ -473,7 +476,7 @@ func TestSortedSetFlow_ContextCancellation(t *testing.T) {
 	}
 
 	workerCtx, cancel := context.WithCancel(ctx)
-	msgChan := make(chan api.RequestMessage)
+	msgChan := make(chan *api.InternalRequest)
 
 	done := make(chan bool)
 	go func() {
@@ -510,15 +513,14 @@ func TestSortedSetFlow_Integration(t *testing.T) {
 	flow.Start(ctx)
 
 	// Add message
-	msg := api.RequestMessage{Id: "integration", CreatedUnixSec: strconv.FormatInt(time.Now().Unix(), 10), DeadlineUnixSec: "9999999999"}
-	msgBytes, _ := json.Marshal(msg)
-	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: string(msgBytes)})
+	msg := api.RequestMessage{ID: "integration", Created: time.Now().Unix(), Deadline: 9999999999}
+	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: envelopeJSON(msg)})
 
 	// Should be received on first request channel
 	select {
 	case received := <-flow.RequestChannels()[0].Channel:
-		if received.Id != "integration" {
-			t.Errorf("Expected integration, got %s", received.Id)
+		if received.PublicRequest == nil || received.PublicRequest.ReqID() != "integration" {
+			t.Errorf("Expected integration, got %v", received.PublicRequest)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Integration test timeout")
@@ -544,7 +546,7 @@ func TestSortedSetFlow_ZeroBudget(t *testing.T) {
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
 		requestChannels: []requestChannelData{{
-			channel:   api.RequestChannel{Channel: make(chan api.RequestMessage)},
+			channel:   api.RequestChannel{Channel: make(chan *api.InternalRequest)},
 			queueName: queue,
 		}},
 		pollInterval: 50 * time.Millisecond,
@@ -554,13 +556,12 @@ func TestSortedSetFlow_ZeroBudget(t *testing.T) {
 
 	// Add message with valid deadline
 	msg := api.RequestMessage{
-		Id:              "test-zero-budget",
-		CreatedUnixSec:  strconv.FormatInt(time.Now().Unix(), 10),
-		DeadlineUnixSec: "9999999999",
-		Payload:         map[string]any{"test": "data"},
+		ID:       "test-zero-budget",
+		Created:  time.Now().Unix(),
+		Deadline: 9999999999,
+		Payload:  map[string]any{"test": "data"},
 	}
-	msgBytes, _ := json.Marshal(msg)
-	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: string(msgBytes)})
+	rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix()), Member: envelopeJSON(msg)})
 
 	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue)
 
@@ -584,8 +585,8 @@ func TestSortedSetFlow_ZeroBudget(t *testing.T) {
 	// Message should now be pulled
 	select {
 	case received := <-flow.requestChannels[0].channel.Channel:
-		if received.Id != "test-zero-budget" {
-			t.Errorf("Expected test-zero-budget, got %s", received.Id)
+		if received.PublicRequest == nil || received.PublicRequest.ReqID() != "test-zero-budget" {
+			t.Errorf("Expected test-zero-budget, got %v", received.PublicRequest)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Message should be pulled after budget increased")
@@ -616,7 +617,7 @@ func TestSortedSetFlow_ResultRetryAfterFailure(t *testing.T) {
 
 	go flow.resultWorker(ctx)
 
-	flow.resultChannel <- api.ResultMessage{Id: "retry-msg", Payload: "data"}
+	flow.resultChannel <- api.ResultMessage{ID: "retry-msg", Payload: "data"}
 
 	// Wait long enough for the first attempt to fail.
 	time.Sleep(150 * time.Millisecond)
@@ -641,8 +642,8 @@ func TestSortedSetFlow_ResultRetryAfterFailure(t *testing.T) {
 	raw, _ := rdb.RPop(ctx, queue).Result()
 	var msg api.ResultMessage
 	json.Unmarshal([]byte(raw), &msg) // nolint:errcheck
-	if msg.Id != "retry-msg" {
-		t.Errorf("Expected retry-msg, got %s", msg.Id)
+	if msg.ID != "retry-msg" {
+		t.Errorf("Expected retry-msg, got %s", msg.ID)
 	}
 }
 
@@ -674,12 +675,14 @@ func TestSortedSetFlow_RetryWorkerDrainsOnShutdown(t *testing.T) {
 	for i := 0; i < totalMessages; i++ {
 		flow.retryChannel <- api.RetryMessage{
 			EmbelishedRequestMessage: api.EmbelishedRequestMessage{
-				RequestMessage: api.RequestMessage{
-					Id:              "drain-" + strconv.Itoa(i),
-					CreatedUnixSec:  strconv.FormatInt(time.Now().Unix(), 10),
-					DeadlineUnixSec: "9999999999",
-				},
-				Metadata: map[string]string{SORTEDSET_QUEUE_NAME_KEY: queue},
+				InternalRequest: api.NewInternalRequest(
+					api.InternalRouting{RequestQueueName: queue},
+					&api.RequestMessage{
+						ID:       "drain-" + strconv.Itoa(i),
+						Created:  time.Now().Unix(),
+						Deadline: 9999999999,
+					},
+				),
 			},
 			BackoffDurationSeconds: 0,
 		}
@@ -722,12 +725,14 @@ func TestSortedSetFlow_RetryBatchAfterFailure(t *testing.T) {
 
 	flow.retryChannel <- api.RetryMessage{
 		EmbelishedRequestMessage: api.EmbelishedRequestMessage{
-			RequestMessage: api.RequestMessage{
-				Id:              "retry-batch-msg",
-				CreatedUnixSec:  strconv.FormatInt(time.Now().Unix(), 10),
-				DeadlineUnixSec: "9999999999",
-			},
-			Metadata: map[string]string{SORTEDSET_QUEUE_NAME_KEY: queue},
+			InternalRequest: api.NewInternalRequest(
+				api.InternalRouting{RequestQueueName: queue},
+				&api.RequestMessage{
+					ID:       "retry-batch-msg",
+					Created:  time.Now().Unix(),
+					Deadline: 9999999999,
+				},
+			),
 		},
 		BackoffDurationSeconds: 0,
 	}
@@ -765,7 +770,7 @@ func TestSortedSetFlow_PartialBudget(t *testing.T) {
 	flow := &RedisSortedSetFlow{
 		rdb: rdb,
 		requestChannels: []requestChannelData{{
-			channel:   api.RequestChannel{Channel: make(chan api.RequestMessage, 20)},
+			channel:   api.RequestChannel{Channel: make(chan *api.InternalRequest, 20)},
 			queueName: queue,
 		}},
 		pollInterval: 200 * time.Millisecond,
@@ -776,12 +781,11 @@ func TestSortedSetFlow_PartialBudget(t *testing.T) {
 	// Add 10 messages
 	for i := 0; i < 10; i++ {
 		msg := api.RequestMessage{
-			Id:              "msg-" + strconv.Itoa(i),
-			CreatedUnixSec:  strconv.FormatInt(time.Now().Unix(), 10),
-			DeadlineUnixSec: "9999999999",
+			ID:       "msg-" + strconv.Itoa(i),
+			Created:  time.Now().Unix(),
+			Deadline: 9999999999,
 		}
-		msgBytes, _ := json.Marshal(msg)
-		rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix() + int64(i)), Member: string(msgBytes)})
+		rdb.ZAdd(ctx, queue, redis.Z{Score: float64(time.Now().Unix() + int64(i)), Member: envelopeJSON(msg)})
 	}
 
 	go flow.requestWorker(ctx, flow.requestChannels[0].channel.Channel, queue)
