@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/llm-d-incubation/llm-d-async/api"
+	"github.com/llm-d-incubation/llm-d-async/pipeline"
 	"github.com/llm-d-incubation/llm-d-async/pkg/util"
 	"github.com/redis/go-redis/v9"
 
@@ -111,16 +112,16 @@ type QueueConfig struct {
 }
 
 type RequestChannelData struct {
-	requestChannel api.RequestChannel
+	requestChannel pipeline.RequestChannel
 	queueName      string
 }
 
-var _ api.Flow = (*RedisMQFlow)(nil)
+var _ pipeline.Flow = (*RedisMQFlow)(nil)
 
 type RedisMQFlow struct {
 	rdb             *redis.Client
 	requestChannels []RequestChannelData
-	retryChannel    chan api.RetryMessage
+	retryChannel    chan pipeline.RetryMessage
 	resultChannel   chan api.ResultMessage
 }
 
@@ -149,7 +150,7 @@ func NewRedisMQFlow() *RedisMQFlow {
 	for _, cfg := range configs {
 		ch := make(chan *api.InternalRequest)
 
-		channels = append(channels, RequestChannelData{api.RequestChannel{
+		channels = append(channels, RequestChannelData{pipeline.RequestChannel{
 			Channel:            ch,
 			InferenceObjective: cfg.InferenceObjective,
 			RequestPathURL:     util.NormalizeURLPath(cfg.RequestPathURL),
@@ -159,7 +160,7 @@ func NewRedisMQFlow() *RedisMQFlow {
 	return &RedisMQFlow{
 		rdb:             rdb,
 		requestChannels: channels,
-		retryChannel:    make(chan api.RetryMessage),
+		retryChannel:    make(chan pipeline.RetryMessage),
 		resultChannel:   make(chan api.ResultMessage, resultChannelBuffer),
 	}
 }
@@ -176,9 +177,9 @@ func (r *RedisMQFlow) Start(ctx context.Context) {
 
 	go r.resultWorker(ctx, *resultQueueName)
 }
-func (r *RedisMQFlow) RequestChannels() []api.RequestChannel {
+func (r *RedisMQFlow) RequestChannels() []pipeline.RequestChannel {
 
-	var channels []api.RequestChannel
+	var channels []pipeline.RequestChannel
 	for _, channelData := range r.requestChannels {
 		channels = append(channels, channelData.requestChannel)
 	}
@@ -186,7 +187,7 @@ func (r *RedisMQFlow) RequestChannels() []api.RequestChannel {
 
 }
 
-func (r *RedisMQFlow) RetryChannel() chan api.RetryMessage {
+func (r *RedisMQFlow) RetryChannel() chan pipeline.RetryMessage {
 	return r.retryChannel
 }
 
@@ -272,15 +273,15 @@ func requestWorker(ctx context.Context, rdb *redis.Client, msgChannel chan *api.
 
 }
 
-func (r *RedisMQFlow) Characteristics() api.Characteristics {
-	return api.Characteristics{
+func (r *RedisMQFlow) Characteristics() pipeline.Characteristics {
+	return pipeline.Characteristics{
 		HasExternalBackoff:     false,
 		SupportsMessageLatency: false,
 	}
 }
 
 // Puts msgs from the retry channel into a Redis sorted-set with a duration Score.
-func addMsgToRetryWorker(ctx context.Context, rdb *redis.Client, retryChannel chan api.RetryMessage, sortedSetName string) {
+func addMsgToRetryWorker(ctx context.Context, rdb *redis.Client, retryChannel chan pipeline.RetryMessage, sortedSetName string) {
 	logger := log.FromContext(ctx)
 	for {
 		select {
