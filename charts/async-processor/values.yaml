@@ -14,6 +14,12 @@ ap:
     requestSubscriberId: ""
     resultTopicId: ""
     requestPathURL: "/v1/completions"
+  tls:
+    secretName: ""
+    insecureSkipVerify: false
+    caCertKey: ""
+    certKey: ""
+    keyKey: ""
   redis:
     enabled: false
     # Secret containing the Redis URL (e.g. redis://user:pass@host:port/db or rediss://... for TLS)
