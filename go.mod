@@ -43,6 +43,12 @@ require (
 	sigs.k8s.io/gateway-api-inference-extension v1.2.1
 )
 
+replace github.com/llm-d/llm-d-async/api => ./api
+
+replace github.com/llm-d/llm-d-async/pipeline => ./pipeline
+
+replace github.com/llm-d/llm-d-async/producer => ./producer
+
 replace google.golang.org/grpc v1.79.2 => google.golang.org/grpc v1.79.3
 
 require (
